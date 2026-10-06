@@ -1,0 +1,455 @@
+diff --git a/packages/cli/src/canvas/api.ts b/packages/cli/src/canvas/api.ts
+index 0922a42..8c96908 100644
+--- a/packages/cli/src/canvas/api.ts
++++ b/packages/cli/src/canvas/api.ts
+@@ -1,9 +1,5 @@
+ import { z } from "zod";
+-import {
+-  assertNever,
+-  safeParseGraphDoc,
+-  type GraphDoc,
+-} from "@contour/schema";
++import { assertNever, safeParseGraphDoc, type GraphDoc } from "@contour/schema";
+
+ import { CLI_VERSION } from "../version.js";
+ import { PrLensCliError } from "../errors.js";
+@@ -99,6 +95,18 @@ type Request = {
+
+ const hostOf = (api: string): string => new URL(api).host;
+
++export const canvasRevisionConflict = (
++  api: string,
++  id: string,
++  expected: number,
++  actual: number,
++): PrLensCliError =>
++  new PrLensCliError(
++    "CANVAS_CONFLICT",
++    `${id} is at rev ${actual} on ${hostOf(api)}, not rev ${expected}`,
++    "contour canvas pull, then push again",
++  );
++
+ const unavailable = (
+   api: string,
+   status: number | undefined,
+@@ -144,11 +152,14 @@ const refusal = (
+             "if the token was rotated elsewhere, pull the current edit link to record it",
+           );
+     case "REVISION_MOVED":
+-      return new PrLensCliError(
+-        "CANVAS_CONFLICT",
+-        `${request.canvas ?? "the canvas"} is at rev ${error.rev} on ${hostOf(api)}, not rev ${request.ifMatch ?? "?"}`,
+-        "contour canvas pull, then push again",
+-      );
++      return request.canvas === undefined || request.ifMatch === undefined
++        ? unavailable(api, status, error.message)
++        : canvasRevisionConflict(
++            api,
++            request.canvas,
++            request.ifMatch,
++            error.rev,
++          );
+     case "INVALID_DOCUMENT":
+       return new PrLensCliError(
+         "CANVAS_REJECTED",
+diff --git a/packages/cli/src/canvas/registry.ts b/packages/cli/src/canvas/registry.ts
+index 0e90ef4..d7b0d83 100644
+--- a/packages/cli/src/canvas/registry.ts
++++ b/packages/cli/src/canvas/registry.ts
+@@ -12,7 +12,7 @@ import {
+ } from "node:fs/promises";
+ import type { Stats } from "node:fs";
+ import { randomBytes } from "node:crypto";
+-import { assertNever } from "@contour/schema";
++import { GraphDoc, assertNever } from "@contour/schema";
+ import { setTimeout as sleep } from "node:timers/promises";
+ import { basename, dirname, join, relative, resolve, sep } from "node:path";
+
+@@ -34,6 +34,15 @@ export const isCanvasId = (value: string): boolean => CANVAS_ID.test(value);
+ export const mintWriteToken = (): string =>
+   randomBytes(16).toString("base64url");
+
++const PendingPush = z.object({
++  /** Revision the attempted write was conditional on. */
++  baseRev: z.number().int().nonnegative(),
++  /** Parsed graph content, retained so an uncommitted attempt can be continued. */
++  document: GraphDoc,
++  /** Source association to record only once the attempted document is hosted. */
++  source: z.string(),
++});
++
+ const Entry = z.object({
+   name: z.string(),
+   source: z.string(),
+@@ -43,6 +52,8 @@ const Entry = z.object({
+   writeToken: z.string().optional(),
+   /** Next token of a rotation whose answer has not arrived yet, so it can be asked again. */
+   pending: z.string().optional(),
++  /** Push whose remote outcome was not durably acknowledged here yet. */
++  pendingPush: PendingPush.optional(),
+   rev: z.number().int().nonnegative(),
+ });
+
+@@ -446,7 +457,10 @@ export const findBySource = (
+ ): Registered | undefined => {
+   const key = sourceKey(path);
+   const matching = entries(registry).filter(
+-    ({ entry }) => sourceKey(entry.source) === key,
++    ({ entry }) =>
++      sourceKey(entry.source) === key ||
++      (entry.pendingPush !== undefined &&
++        sourceKey(entry.pendingPush.source) === key),
+   );
+   const [only, ...more] = matching;
+   if (more.length > 0)
+diff --git a/packages/cli/src/commands/canvas.ts b/packages/cli/src/commands/canvas.ts
+index bd3e8db..41dfc24 100644
+--- a/packages/cli/src/commands/canvas.ts
++++ b/packages/cli/src/commands/canvas.ts
+@@ -1,11 +1,6 @@
+ import { assertNever } from "@contour/schema";
+
+-import {
+-  fetchCanvas,
+-  mintCanvas,
+-  pushCanvas,
+-  verifyWriteToken,
+-} from "../canvas/api.js";
++import { fetchCanvas, mintCanvas, verifyWriteToken } from "../canvas/api.js";
+ import {
+   ensureRegistryHome,
+   findBySource,
+@@ -29,9 +24,23 @@ import { readGraphDoc } from "../document.js";
+ import type { Terminal } from "../terminal.js";
+ import { WORKSPACE_DIR } from "../workspace.js";
+ import { deleteCommand } from "../canvas/delete.js";
++import {
++  carryOutPreparedPush,
++  preparePush,
++  sameGraphDocument,
++  settlePendingPush,
++} from "../canvas/push.js";
+ import { parseOptions, readString } from "../args.js";
+ import { PrLensCliError, usageError } from "../errors.js";
+-import { DEFAULT_API, API_ENV, readApi, requireSameApi, requireWriteToken, settleRotation, settlePendingRotation } from "../canvas/write.js";
++import {
++  DEFAULT_API,
++  API_ENV,
++  readApi,
++  requireSameApi,
++  requireWriteToken,
++  settleRotation,
++  settlePendingRotation,
++} from "../canvas/write.js";
+
+ const DEFAULT_SOURCE = `${WORKSPACE_DIR}/drawn.graph.json`;
+ const DEFAULT_OUT = `${WORKSPACE_DIR}/graph.json`;
+@@ -135,6 +144,7 @@ const recordPull = (current: CanvasRegistry, pull: PullRecord): Recorded => {
+
+   const kept = imports ? pull.writeToken : entry?.writeToken;
+   const pending = imports ? undefined : entry?.pending;
++  const pendingPush = entry?.pendingPush;
+
+   current.canvases[pull.id] = {
+     name: entry?.name ?? pull.fetched?.title ?? pull.id,
+@@ -143,6 +153,7 @@ const recordPull = (current: CanvasRegistry, pull: PullRecord): Recorded => {
+       (pull.fetched === undefined ? DEFAULT_SOURCE : sourceKey(pull.out)),
+     api: pull.api,
+     ...(pending === undefined ? {} : { pending }),
++    ...(pendingPush === undefined ? {} : { pendingPush }),
+     ...(kept === undefined ? {} : { writeToken: kept }),
+     rev: pull.fetched?.rev ?? entry?.rev ?? 0,
+   };
+@@ -254,29 +265,38 @@ const push = async (
+       return { id: minted.id, entry };
+     }));
+
+-  const target = await settlePendingRotation(api, registered, terminal);
+-
+-  const pushed = await pushCanvas(
+-    api,
+-    target.id,
+-    requireWriteToken(target),
+-    target.entry.rev,
+-    document,
+-  );
+-
+-  await updateRegistry((current) => {
+-    current.canvases[target.id] = {
+-      ...(current.canvases[target.id] ?? target.entry),
+-      source: sourceKey(source),
+-      rev: pushed.rev,
+-    };
+-  }, terminal);
++  const rotated = await settlePendingRotation(api, registered, terminal);
++  const settled = await settlePendingPush(api, rotated, terminal);
++  const completed =
++    settled.attempted !== undefined &&
++    sameGraphDocument(settled.attempted, document)
++      ? settled.published
++      : (
++          await carryOutPreparedPush(
++            api,
++            await preparePush(
++              api,
++              settled.registered,
++              document,
++              sourceKey(source),
++              terminal,
++            ),
++            terminal,
++          )
++        ).published;
++
++  if (completed === undefined)
++    throw new PrLensCliError(
++      "UNREADABLE_FILE",
++      `the push for ${settled.registered.id} was settled without an answer`,
++      "run contour canvas push again",
++    );
+
+   terminal.out(
+-    `✓ ${pushed.viewUrl} — rev ${pushed.rev} · ${countDiagrams(pushed.tiles.length)}`,
++    `✓ ${completed.viewUrl} — rev ${completed.rev} · ${countDiagrams(completed.tiles.length)}`,
+   );
+   terminal.out("  unlisted: anyone you share it with can open it, no sign-in needed");
+-  terminal.out(`  README embed: ${pushed.embedUrl}`);
++  terminal.out(`  README embed: ${completed.embedUrl}`);
+   terminal.out("  remove: contour canvas delete");
+ };
+
+diff --git a/packages/cli/src/canvas/push.ts b/packages/cli/src/canvas/push.ts
+new file mode 100644
+index 0000000..840a7e8
+--- /dev/null
++++ b/packages/cli/src/canvas/push.ts
+@@ -0,0 +1,229 @@
++import { isDeepStrictEqual } from "node:util";
++import type { GraphDoc } from "@contour/schema";
++
++import {
++  canvasRevisionConflict,
++  fetchCanvas,
++  pushCanvas,
++  type Fetched,
++} from "./api.js";
++import {
++  REGISTRY_PATH,
++  updateRegistry,
++  type CanvasEntry,
++  type Registered,
++} from "./registry.js";
++import { requireSameApi, requireWriteToken } from "./write.js";
++import type { Terminal } from "../terminal.js";
++import { PrLensCliError } from "../errors.js";
++
++type PendingPush = NonNullable<CanvasEntry["pendingPush"]>;
++export type PublishedCanvas = Pick<
++  Fetched,
++  "id" | "rev" | "viewUrl" | "embedUrl" | "tiles"
++>;
++
++export const sameGraphDocument = (a: GraphDoc, b: GraphDoc): boolean =>
++  isDeepStrictEqual(a, b);
++
++const samePendingPush = (a: PendingPush | undefined, b: PendingPush): boolean =>
++  a !== undefined &&
++  a.baseRev === b.baseRev &&
++  a.source === b.source &&
++  sameGraphDocument(a.document, b.document);
++
++const registryChanged = (id: string): PrLensCliError =>
++  new PrLensCliError(
++    "UNREADABLE_FILE",
++    `${REGISTRY_PATH} changed while the push for ${id} was being settled`,
++    "run contour canvas push again",
++  );
++
++const acknowledge = async (
++  api: string,
++  id: string,
++  pending: PendingPush,
++  rev: number,
++  terminal: Terminal,
++): Promise<Registered> => {
++  let registered: Registered | undefined;
++  await updateRegistry((registry) => {
++    const current = registry.canvases[id];
++    if (
++      current === undefined ||
++      current.api !== api ||
++      !samePendingPush(current.pendingPush, pending)
++    )
++      return;
++
++    const entry: CanvasEntry = {
++      ...current,
++      source: pending.source,
++      rev,
++      pendingPush: undefined,
++    };
++    registry.canvases[id] = entry;
++    registered = { id, entry };
++  }, terminal);
++
++  if (registered === undefined) throw registryChanged(id);
++  return registered;
++};
++
++const clearDefiniteFailure = async (
++  api: string,
++  id: string,
++  pending: PendingPush,
++  terminal: Terminal,
++): Promise<void> => {
++  await updateRegistry((registry) => {
++    const current = registry.canvases[id];
++    if (
++      current === undefined ||
++      current.api !== api ||
++      !samePendingPush(current.pendingPush, pending)
++    )
++      return;
++    registry.canvases[id] = { ...current, pendingPush: undefined };
++  }, terminal);
++};
++
++const isDefiniteRefusal = (error: PrLensCliError): boolean =>
++  error.code === "CANVAS_CONFLICT" ||
++  error.code === "CANVAS_REJECTED" ||
++  error.code === "CANVAS_UNKNOWN" ||
++  error.code === "CANVAS_RATE_LIMITED";
++
++const carryOut = async (
++  api: string,
++  registered: Registered,
++  pending: PendingPush,
++  terminal: Terminal,
++  clearRefusal: boolean,
++): Promise<{ registered: Registered; published: PublishedCanvas }> => {
++  const published = await pushCanvas(
++    api,
++    registered.id,
++    requireWriteToken(registered),
++    pending.baseRev,
++    pending.document,
++  ).catch(async (error: unknown) => {
++    if (
++      clearRefusal &&
++      error instanceof PrLensCliError &&
++      isDefiniteRefusal(error)
++    )
++      await clearDefiniteFailure(api, registered.id, pending, terminal);
++    throw error;
++  });
++
++  return {
++    registered: await acknowledge(
++      api,
++      registered.id,
++      pending,
++      published.rev,
++      terminal,
++    ),
++    published,
++  };
++};
++
++export type SettledPendingPush = {
++  registered: Registered;
++  attempted: GraphDoc | undefined;
++  published: PublishedCanvas | undefined;
++};
++
++/** Reconciles an earlier uncertain push before the caller considers today's document. */
++export const settlePendingPush = async (
++  api: string,
++  registered: Registered,
++  terminal: Terminal,
++): Promise<SettledPendingPush> => {
++  requireSameApi(api, registered);
++  requireWriteToken(registered);
++  const pending = registered.entry.pendingPush;
++  if (pending === undefined)
++    return { registered, attempted: undefined, published: undefined };
++
++  const fetched = await fetchCanvas(api, registered.id).catch(
++    (error: unknown) => {
++      if (
++        pending.baseRev === 0 &&
++        error instanceof PrLensCliError &&
++        error.code === "CANVAS_UNKNOWN"
++      )
++        return undefined;
++      throw error;
++    },
++  );
++
++  if (fetched === undefined || fetched.rev === pending.baseRev) {
++    const continued = await carryOut(api, registered, pending, terminal, false);
++    return { ...continued, attempted: pending.document };
++  }
++
++  if (
++    fetched.rev === pending.baseRev + 1 &&
++    sameGraphDocument(fetched.document, pending.document)
++  ) {
++    return {
++      registered: await acknowledge(
++        api,
++        registered.id,
++        pending,
++        fetched.rev,
++        terminal,
++      ),
++      attempted: pending.document,
++      published: fetched,
++    };
++  }
++
++  throw canvasRevisionConflict(
++    api,
++    registered.id,
++    pending.baseRev,
++    fetched.rev,
++  );
++};
++
++/** Saves the complete request identity before its remote side effect begins. */
++export const preparePush = async (
++  api: string,
++  registered: Registered,
++  document: GraphDoc,
++  source: string,
++  terminal: Terminal,
++): Promise<Registered> => {
++  let prepared: Registered | undefined;
++  await updateRegistry((registry) => {
++    const current = registry.canvases[registered.id];
++    if (current === undefined) return;
++    const selected = { id: registered.id, entry: current };
++    requireSameApi(api, selected);
++    requireWriteToken(selected);
++    if (current.pendingPush !== undefined) return;
++
++    const entry: CanvasEntry = {
++      ...current,
++      pendingPush: { baseRev: current.rev, document, source },
++    };
++    registry.canvases[registered.id] = entry;
++    prepared = { id: registered.id, entry };
++  }, terminal);
++
++  if (prepared === undefined) throw registryChanged(registered.id);
++  return prepared;
++};
++
++export const carryOutPreparedPush = async (
++  api: string,
++  registered: Registered,
++  terminal: Terminal,
++): Promise<{ registered: Registered; published: PublishedCanvas }> => {
++  const pending = registered.entry.pendingPush;
++  if (pending === undefined) throw registryChanged(registered.id);
++  return carryOut(api, registered, pending, terminal, true);
++};
